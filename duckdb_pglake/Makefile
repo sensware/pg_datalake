@@ -11,7 +11,7 @@ EXT_FLAGS=-DBUILD_EXTENSIONS="tpch;json;icu"
 # GitHub actions uses a hash of the Makefile and source
 # files as a cache key. When we update the DuckDB version,
 # we should update the line below to trigger a new hash.
-DUCKDB_VERSION=1.3.2
+DUCKDB_VERSION=1.4.2
 
 # We install libduckdb.so into the postgres direcotry
 PG_CONFIG ?= pg_config
@@ -132,23 +132,24 @@ release: patch_duckdb
 
 #### Misc
 
-# patch exit code 1 means the patch is already applied, since we might run this multiple times, be robust
-patch_duckdb:
-	cd duckdb && \
-	find ../patches/duckdb -type f -name '*.patch' -print | xargs -0 printf '%s ' | \
-	while read -r patch; do \
-	patch -l -p1 -N < "$$patch" || [ $$? -eq 1 ]; \
+# we assume that any modified files in these subdirs indicate that we have
+# already been patched.  This does mean if you have updated updating the patches here you
+# will need to reset the repositories so the new patches will be picked up.
+
+.patches_applied: $(shell find patches -type f -name '*.patch')
+	for patchdir in duckdb duckdb-postgres duckdb-azure; do \
+		(cd $$patchdir && \
+		git checkout -f . && \
+		find ../patches/$$patchdir -type f -name '*.patch' -print | sort | xargs -0 printf '%s ' | \
+		while read -r patch; do \
+			echo "applying $$patch to $$patchdir" ; \
+			git apply --ignore-whitespace "$$patch"; \
+		done;) \
 	done
-	cd duckdb-postgres && \
-	find ../patches/duckdb-postgres -type f -name '*.patch' -print | xargs -0 printf '%s ' | \
-	while read -r patch; do \
-	patch -l -p1 -N < "$$patch" || [ $$? -eq 1 ]; \
-	done
-	cd duckdb-azure && \
-	find ../patches/duckdb-azure -type f -name '*.patch' -print | xargs -0 printf '%s ' | \
-	while read -r patch; do \
-	patch -l -p1 -N < "$$patch" || [ $$? -eq 1 ]; \
-	done
+	touch .patches_applied
+
+patch_duckdb: .patches_applied
+
 
 format:
 	find src/ -iname *.hpp -o -iname *.cpp | xargs clang-format --sort-includes=0 -style=file -i
