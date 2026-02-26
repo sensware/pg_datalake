@@ -371,3 +371,29 @@ jobs:
           pg_version: ${{ env.to_pg_version }}
           from_pg_version: ${{ env.from_pg_version }}
           upgrade: 'true'
+
+  # Aggregate job: use this single check as the required status check in branch
+  # protection instead of managing all 62 individual matrix job names.
+  all-checks-pass:
+    name: All checks pass
+    if: always()
+    needs:
+      - build-and-install-almalinux
+      - build-and-install-debian
+      - test-check
+      - test-check-pg-lake-table
+      - test-installcheck
+      - test-installcheck-postgres
+      - test-installcheck-pg-lake-table
+      - test-isolation
+      - test-upgrade
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          if echo "$results" | grep -qE '"failure"|"cancelled"'; then
+            echo "One or more required jobs failed or were cancelled"
+            exit 1
+          fi
+          echo "All required jobs passed or were skipped"
