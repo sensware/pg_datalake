@@ -112,12 +112,13 @@ RETURNS TABLE (
     updated_at             timestamptz
 )
 LANGUAGE plpgsql
-STABLE
+VOLATILE
 AS $$
 DECLARE
     v_global_age_hours int;
 BEGIN
     -- Read the global GUC (seconds → hours); 0 means expiration disabled.
+    -- VOLATILE because current_setting() is session-dependent.
     BEGIN
         v_global_age_hours :=
             current_setting('pg_lake_iceberg.max_snapshot_age')::bigint / 3600;
@@ -175,49 +176,77 @@ COMMENT ON FUNCTION lake_governance.drop_snapshot_policy(regclass) IS
 After removal the table reverts to the global GUC setting.';
 
 -- ---------------------------------------------------------------
--- expire_snapshots — manually trigger snapshot expiration
+-- expire_snapshots — prepare and schedule snapshot expiration
 -- ---------------------------------------------------------------
 --
--- Runs VACUUM on the Iceberg table which invokes the C-level
--- RemoveOldSnapshotsFromMetadata() / flush_deletion_queue()
--- pipeline.  Expiration respects the per-table policy (if set)
--- via pg_lake_iceberg.max_snapshot_age at the session level,
--- or the global GUC if no per-table policy exists.
+-- PostgreSQL does not permit VACUUM to run inside a transaction block,
+-- so this function cannot invoke VACUUM directly.  Instead it:
+--
+--   1. Looks up the effective per-table policy (or global GUC).
+--   2. Applies the resolved max-age to the *session* GUC via
+--      set_config() so that the very next VACUUM (whether run
+--      manually or by autovacuum) picks up the correct retention
+--      window.
+--   3. Emits a NOTICE with the exact VACUUM command to run and
+--      returns it as text so callers can execute it programmatically
+--      outside a transaction if required.
+--
+-- Usage:
+--   SELECT lake_governance.expire_snapshots('public.my_table');
+--   -- Then, outside a transaction block:
+--   VACUUM public.my_table;
 -- ---------------------------------------------------------------
 CREATE OR REPLACE FUNCTION lake_governance.expire_snapshots(
     p_table regclass
 )
-RETURNS void
+RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
     v_policy      record;
     v_age_seconds bigint;
+    v_vacuum_cmd  text;
 BEGIN
-    -- Fetch the effective per-table age, if any.
     SELECT * INTO v_policy
     FROM   lake_governance.get_snapshot_policy(p_table);
 
+    v_vacuum_cmd := format('VACUUM %s', p_table);
+
     IF v_policy.max_snapshot_age_hours IS NOT NULL THEN
         v_age_seconds := v_policy.max_snapshot_age_hours * 3600;
-        -- Temporarily apply the per-table max age for this session so
-        -- the C expiration logic picks it up during the VACUUM run.
-        EXECUTE format(
-            'SET LOCAL pg_lake_iceberg.max_snapshot_age = %s',
-            v_age_seconds
+        /*
+         * set_config(guc, value, is_local=false) applies for the rest of
+         * the session (not just this transaction), so the subsequent VACUUM
+         * call — even outside this transaction — will see the correct age.
+         */
+        PERFORM set_config(
+            'pg_lake_iceberg.max_snapshot_age',
+            v_age_seconds::text,
+            false   /* session-level, not transaction-local */
         );
+        RAISE NOTICE
+            'Session GUC pg_lake_iceberg.max_snapshot_age set to % s (% h) for table %. '
+            'Run outside a transaction: %',
+            v_age_seconds, v_policy.max_snapshot_age_hours, p_table, v_vacuum_cmd;
+    ELSE
+        RAISE NOTICE
+            'No per-table policy for %; using global GUC. '
+            'Run outside a transaction: %',
+            p_table, v_vacuum_cmd;
     END IF;
 
-    EXECUTE format('VACUUM %s', p_table);
+    RETURN v_vacuum_cmd;
 END;
 $$;
 REVOKE ALL   ON FUNCTION lake_governance.expire_snapshots(regclass) FROM public;
 GRANT  EXECUTE ON FUNCTION lake_governance.expire_snapshots(regclass) TO lake_admin;
 
 COMMENT ON FUNCTION lake_governance.expire_snapshots(regclass) IS
-'Manually trigger Iceberg snapshot expiration for a table. If a per-table
-policy exists its max_snapshot_age_hours is applied for the duration of the
-call via SET LOCAL before running VACUUM.';
+'Prepare snapshot expiration for an Iceberg table.
+Applies the per-table max_snapshot_age_hours to the session GUC (if a policy
+exists) and returns the VACUUM command the caller must run outside a
+transaction block to actually expire snapshots.
+VACUUM cannot run inside a transaction, so this function never calls it directly.';
 
 -- ---------------------------------------------------------------
 -- snapshot_compliance view
